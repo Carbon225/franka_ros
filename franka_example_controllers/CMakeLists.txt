@@ -132,7 +132,7 @@ install(FILES franka_example_controllers_plugin.xml
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 catkin_install_python(
-  PROGRAMS scripts/interactive_marker.py scripts/move_to_start.py scripts/dual_arm_interactive_marker.py
+  PROGRAMS scripts/interactive_marker.py scripts/move_to_start.py scripts/dual_arm_interactive_marker.py scripts/draw_circle.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
