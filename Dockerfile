@@ -30,19 +30,21 @@ ARG OVERLAY_WS
 WORKDIR $OVERLAY_WS
 COPY --from=cacher /tmp/$OVERLAY_WS/src ./src
 RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
-    apt-get update && rosdep install -y \
+    apt-get update \
+    && apt-get install -y python3-catkin-tools ros-$ROS_DISTRO-catkin-virtualenv python3-testresources nlohmann-json3-dev \
+    && rosdep install -y \
       --from-paths \
         src/franka_ros \
       --ignore-src \
-    && apt-get install -y nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # build overlay source
 COPY --from=cacher $OVERLAY_WS/src ./src
 
 RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
-    catkin_make && \
-    catkin_make install
+    catkin init && \
+    catkin config --install --cmake-args -DCMAKE_BUILD_TYPE=Release && \
+    catkin build
 
 # source entrypoint setup
 ENV OVERLAY_WS=$OVERLAY_WS
