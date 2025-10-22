@@ -26,7 +26,9 @@ solver = "daqp"
 pos_threshold = 0.010
 ori_threshold = 0.1
 max_iters = 10
-timestep = 0.05
+timestep = 0.01
+critical_pos_threshold = 0.100
+critical_ori_threshold = 0.3
 
 
 def joint_state_callback(msg):
@@ -47,25 +49,36 @@ def pose_callback(msg):
         ])
     ))
 
+    solved = False
+
     for _ in range(max_iters):
         vel = mink.solve_ik(
             configuration, tasks, timestep, solver, limits=limits
         )
         configuration.integrate_inplace(vel, timestep)
         err = end_effector_task.compute_error(configuration)
-        pos_achieved = np.linalg.norm(err[:3]) <= pos_threshold
-        ori_achieved = np.linalg.norm(err[3:]) <= ori_threshold
-        if pos_achieved and ori_achieved:
-            rospy.logdebug('Solved within threshold')
-            break
-    else:
         pos_error = np.linalg.norm(err[:3])
         ori_error = np.linalg.norm(err[3:])
-        rospy.logwarn('Failed to solve within threshold: pos_error=%f, ori_error=%f', pos_error, ori_error)
+        pos_achieved = pos_error <= pos_threshold
+        ori_achieved = ori_error <= ori_threshold
+        if pos_achieved and ori_achieved:
+            rospy.logdebug('Solved within threshold')
+            solved = True
+            break
+    else:
+        if pos_error > critical_pos_threshold or ori_error > critical_ori_threshold:
+            rospy.logerr('Failed to solve within critical threshold: pos_error=%f, ori_error=%f', pos_error, ori_error)
+            # Do not execute infeasible solutions
+            return
+        else:
+            rospy.logwarn('Failed to solve within threshold: pos_error=%f, ori_error=%f', pos_error, ori_error)
+            # Acceptable error
+            solved = True
 
-    msg = Float64MultiArray()
-    msg.data = configuration.q[:] # Exclude gripper joint
-    joint_group_position_controller_pub.publish(msg)
+    if solved:
+        msg = Float64MultiArray()
+        msg.data = configuration.q[:]
+        joint_group_position_controller_pub.publish(msg)
 
     # Restore configuration to actual robot state
     configuration.update(qpos0)
@@ -106,19 +119,16 @@ def main():
             frame_type="site",
             position_cost=4.0,
             orientation_cost=1.0,
-            lm_damping=1e-6,
+            lm_damping=1e-2,
         ),
         posture_task := mink.PostureTask(model, cost=1e-1),
     ]
 
     limits = [
-        mink.ConfigurationLimit(model=configuration.model),
+        mink.ConfigurationLimit(model=configuration.model, gain=0.1, min_distance_from_limits=np.radians(45)),
     ]
 
-    data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
-    mujoco.mj_forward(model, data)
-    configuration.update(data.qpos)
+    configuration.update_from_keyframe('home')
     posture_task.set_target_from_configuration(configuration)
 
     rospy.loginfo('Mink setup complete')
