@@ -44,7 +44,8 @@ COPY --from=cacher $OVERLAY_WS/src ./src
 RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
     catkin init && \
     catkin config --install --cmake-args -DCMAKE_BUILD_TYPE=Release && \
-    catkin build
+    catkin build franka_ai franka_control franka_description franka_gripper franka_hw franka_msgs && \
+    rm -rf build log
 
 # source entrypoint setup
 ENV OVERLAY_WS=$OVERLAY_WS
