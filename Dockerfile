@@ -52,6 +52,8 @@ RUN sed --in-place --expression \
       '$isource "$OVERLAY_WS/install/setup.bash"' \
       /ros_entrypoint.sh
 
+ENV ROS_IP=192.168.42.1
+ENV ROS_MASTER_URI=http://192.168.42.1:11311
 USER root
 ENTRYPOINT ["/ros_entrypoint.sh"]
 CMD ["bash"]
