@@ -10,6 +10,7 @@ project(franka_ai)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
+  catkin_virtualenv
   std_msgs
 )
 
@@ -153,6 +154,11 @@ include_directories(
 #############
 ## Install ##
 #############
+
+catkin_generate_virtualenv(PYTHON_INTERPRETER python3.8)
+
+install(FILES requirements.txt
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
 
 catkin_install_python(PROGRAMS
   scripts/interactive_marker.py
