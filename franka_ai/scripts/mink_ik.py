@@ -13,6 +13,7 @@ import mujoco
 
 
 joint_group_position_controller_pub = None
+first_joint_state_received = False
 
 model = None
 
@@ -34,10 +35,16 @@ critical_ori_threshold = 0.3
 def joint_state_callback(msg):
     rospy.logdebug('Received joint states:\n%s', msg)
     configuration.update(msg.position[:7])
+    global first_joint_state_received
+    first_joint_state_received = True
 
 
 def pose_callback(msg):
     rospy.logdebug('Received pose:\n%s', msg.pose)
+
+    if not first_joint_state_received:
+        rospy.logwarn('No joint states received yet, skipping IK')
+        return
 
     # Save configuration before solving inplace
     qpos0 = configuration.q[:]
@@ -138,8 +145,8 @@ def main():
 
     global joint_group_position_controller_pub
     joint_group_position_controller_pub = rospy.Publisher('joint_group_position_controller/command', Float64MultiArray, queue_size=1)
-    rospy.Subscriber('joint_states', JointState, joint_state_callback)
-    rospy.Subscriber('equilibrium_pose', PoseStamped, pose_callback)
+    rospy.Subscriber('joint_states', JointState, joint_state_callback, queue_size=1)
+    rospy.Subscriber('equilibrium_pose', PoseStamped, pose_callback, queue_size=1)
     rospy.spin()
 
 
