@@ -2,7 +2,7 @@
 
 import rospy
 import rospkg
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
@@ -32,29 +32,13 @@ critical_pos_threshold = 0.100
 critical_ori_threshold = 0.3
 
 
-def joint_state_callback(msg):
-    rospy.logdebug('Received joint states:\n%s', msg)
-    configuration.update(msg.position[:7])
-    global first_joint_state_received
-    first_joint_state_received = True
-
-
-def pose_callback(msg):
-    rospy.logdebug('Received pose:\n%s', msg.pose)
-
+def solve_and_publish():
     if not first_joint_state_received:
         rospy.logwarn('No joint states received yet, skipping IK')
         return
 
     # Save configuration before solving inplace
     qpos0 = configuration.q[:]
-
-    end_effector_task.set_target(mink.SE3(
-        wxyz_xyz=np.array([
-            msg.pose.orientation.w, msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z,
-            msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
-        ])
-    ))
 
     solved = False
 
@@ -76,7 +60,6 @@ def pose_callback(msg):
         if pos_error > critical_pos_threshold or ori_error > critical_ori_threshold:
             rospy.logerr('Failed to solve within critical threshold: pos_error=%f, ori_error=%f', pos_error, ori_error)
             # Do not execute infeasible solutions
-            return
         else:
             rospy.logwarn('Failed to solve within threshold: pos_error=%f, ori_error=%f', pos_error, ori_error)
             # Acceptable error
@@ -89,6 +72,44 @@ def pose_callback(msg):
 
     # Restore configuration to actual robot state
     configuration.update(qpos0)
+
+
+def joint_state_callback(msg):
+    rospy.logdebug('Received joint states:\n%s', msg)
+    configuration.update(msg.position[:7])
+    global first_joint_state_received
+    if not first_joint_state_received:
+        end_effector_task.set_target_from_configuration(configuration)
+        first_joint_state_received = True
+
+
+def pose_callback(msg):
+    rospy.logdebug('Received pose:\n%s', msg.pose)
+
+    end_effector_task.set_target(mink.SE3(
+        wxyz_xyz=np.array([
+            msg.pose.orientation.w, msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z,
+            msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
+        ])
+    ))
+
+    solve_and_publish()
+
+
+def twist_callback(msg):
+    rospy.logdebug('Received twist: %s', msg)
+
+    current_pose = configuration.get_transform_frame_to_world("gripper_site", "site")
+    new_target = (
+        mink.SE3.from_rotation_and_translation(
+            mink.SO3.from_rpy_radians(msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z),
+            np.array([msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z]),
+        )
+    ) @ current_pose
+
+    end_effector_task.set_target(new_target)
+
+    solve_and_publish()
 
 
 def main():
@@ -133,9 +154,19 @@ def main():
 
     limits = [
         mink.ConfigurationLimit(model=configuration.model, gain=0.1, min_distance_from_limits=np.radians(45)),
+        mink.VelocityLimit(model=model, velocities={
+            "joint1": 0.5,
+            "joint2": 0.5,
+            "joint3": 0.5,
+            "joint4": 0.5,
+            "joint5": 0.5,
+            "joint6": 0.5,
+            "joint7": 0.5,
+        }),
     ]
 
     configuration.update_from_keyframe('home')
+    end_effector_task.set_target_from_configuration(configuration)
     posture_task.set_target_from_configuration(configuration)
 
     rospy.loginfo('Mink setup complete')
@@ -143,10 +174,15 @@ def main():
 
 
 
+
+    # ---- ROS setup ----
+
     global joint_group_position_controller_pub
     joint_group_position_controller_pub = rospy.Publisher('joint_group_position_controller/command', Float64MultiArray, queue_size=1)
     rospy.Subscriber('joint_states', JointState, joint_state_callback, queue_size=1)
-    rospy.Subscriber('equilibrium_pose', PoseStamped, pose_callback, queue_size=1)
+    rospy.Subscriber('pose_cmd', PoseStamped, pose_callback, queue_size=1)
+    rospy.Subscriber('twist_cmd', Twist, twist_callback, queue_size=1)
+
     rospy.spin()
 
 
