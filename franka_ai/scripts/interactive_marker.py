@@ -60,7 +60,7 @@ def wait_for_initial_pose():
 if __name__ == "__main__":
     rospy.init_node("equilibrium_pose_node")
     listener = tf.TransformListener()
-    link_name = rospy.get_param("~link_name")
+    link_name = 'panda_link0'
 
     wait_for_initial_pose()
 

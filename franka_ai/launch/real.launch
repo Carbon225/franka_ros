@@ -25,16 +25,4 @@
     <rosparam unless="$(arg load_gripper)" param="source_list">[franka_state_controller/joint_states] </rosparam>
     <param name="rate" value="30"/>
   </node>
-
-  <node name="interactive_marker"
-        pkg="franka_ai"
-        type="interactive_marker.py">
-    <param name="link_name" value="$(arg arm_id)_link0" />
-  </node>
-
-  <node name="mink_ik"
-        pkg="franka_ai"
-        type="mink_ik.py"
-        respawn="true"
-        output="screen"/>
 </launch>
