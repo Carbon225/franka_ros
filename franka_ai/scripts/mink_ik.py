@@ -24,12 +24,18 @@ tasks = None
 limits = None
 
 solver = "daqp"
+
+# Configured for 30 Hz
+max_iters = 16
+timestep = 0.002
+
 pos_threshold = 0.010
 ori_threshold = 0.1
-max_iters = 10
-timestep = 0.01
+
 critical_pos_threshold = 0.100
 critical_ori_threshold = 0.3
+
+max_joint_vel = np.radians(360)
 
 
 def solve_and_publish():
@@ -44,7 +50,7 @@ def solve_and_publish():
 
     for _ in range(max_iters):
         vel = mink.solve_ik(
-            configuration, tasks, timestep, solver, limits=limits
+            configuration, tasks, timestep, solver, damping=1e-3, limits=limits
         )
         configuration.integrate_inplace(vel, timestep)
         err = end_effector_task.compute_error(configuration)
@@ -150,16 +156,10 @@ def main():
     ]
 
     limits = [
-        mink.ConfigurationLimit(model=configuration.model, gain=0.9, min_distance_from_limits=np.radians(10)),
+        mink.ConfigurationLimit(model=configuration.model, gain=0.9, min_distance_from_limits=np.radians(20)),
         mink.VelocityLimit(model=model, velocities={
-            "joint1": 2,
-            "joint2": 2,
-            "joint3": 2,
-            "joint4": 2,
-            "joint5": 2,
-            "joint6": 2,
-            "joint7": 2,
-        }),
+            f"joint{i}": max_joint_vel for i in range(1, 8)
+        })
     ]
 
     configuration.update_from_keyframe('home')
