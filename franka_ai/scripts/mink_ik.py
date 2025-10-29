@@ -81,6 +81,7 @@ def joint_state_callback(msg):
     if not first_joint_state_received:
         end_effector_task.set_target_from_configuration(configuration)
         first_joint_state_received = True
+    solve_and_publish()
 
 
 def pose_callback(msg):
@@ -93,8 +94,6 @@ def pose_callback(msg):
         ])
     ))
 
-    solve_and_publish()
-
 
 def twist_callback(msg):
     rospy.logdebug('Received twist: %s', msg)
@@ -102,14 +101,12 @@ def twist_callback(msg):
     current_pose = configuration.get_transform_frame_to_world("gripper_site", "site")
     new_target = (
         mink.SE3.from_rotation_and_translation(
-            mink.SO3.from_rpy_radians(msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z),
-            np.array([msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z]),
+            mink.SO3.from_rpy_radians(msg.angular.x, msg.angular.y, msg.angular.z),
+            np.array([msg.linear.x, msg.linear.y, msg.linear.z]),
         )
     ) @ current_pose
 
     end_effector_task.set_target(new_target)
-
-    solve_and_publish()
 
 
 def main():
@@ -145,23 +142,23 @@ def main():
         end_effector_task := mink.FrameTask(
             frame_name="gripper_site",
             frame_type="site",
-            position_cost=4.0,
+            position_cost=1.0,
             orientation_cost=1.0,
-            lm_damping=1e-2,
+            lm_damping=1.0,
         ),
-        posture_task := mink.PostureTask(model, cost=1e-1),
+        posture_task := mink.PostureTask(model, cost=1e-2),
     ]
 
     limits = [
-        mink.ConfigurationLimit(model=configuration.model, gain=0.1, min_distance_from_limits=np.radians(45)),
+        mink.ConfigurationLimit(model=configuration.model, gain=0.9, min_distance_from_limits=np.radians(10)),
         mink.VelocityLimit(model=model, velocities={
-            "joint1": 0.5,
-            "joint2": 0.5,
-            "joint3": 0.5,
-            "joint4": 0.5,
-            "joint5": 0.5,
-            "joint6": 0.5,
-            "joint7": 0.5,
+            "joint1": 2,
+            "joint2": 2,
+            "joint3": 2,
+            "joint4": 2,
+            "joint5": 2,
+            "joint6": 2,
+            "joint7": 2,
         }),
     ]
 
@@ -180,7 +177,7 @@ def main():
     global joint_group_position_controller_pub
     joint_group_position_controller_pub = rospy.Publisher('joint_group_position_controller/command', Float64MultiArray, queue_size=1)
     rospy.Subscriber('joint_states', JointState, joint_state_callback, queue_size=1)
-    rospy.Subscriber('pose_cmd', PoseStamped, pose_callback, queue_size=1)
+    rospy.Subscriber('equilibrium_pose', PoseStamped, pose_callback, queue_size=1)
     rospy.Subscriber('twist_cmd', Twist, twist_callback, queue_size=1)
 
     rospy.spin()
