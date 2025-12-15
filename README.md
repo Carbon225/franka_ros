@@ -26,7 +26,7 @@ Docker-RT is a minimal OS for the Raspberry Pi 5, preinstalled with Docker and t
 
 ### Connect to the Web UI
 
-1. SSH with port forwarding `sudo ssh -L 127.0.0.1:443:192.168.1.100:443 root@192.168.42.1 sleep inf`
+1. (On the PC) SSH with port forwarding `sudo ssh -L 127.0.0.1:443:192.168.1.100:443 root@192.168.42.1 sleep inf`
 
     This will forward the local port 443 to the robot's port 443.
 
