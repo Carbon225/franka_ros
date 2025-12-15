@@ -36,9 +36,11 @@ Docker-RT is a minimal OS for the Raspberry Pi 5, preinstalled with Docker and t
 
 ### Connect to the robot
 
-1. Ping the robot with `ping 192.168.1.100`
+1. SSH to the Raspberry
 
-2. Move the robot to the starting position with `docker run -it --rm --net=host --privileged franka_ros communication_test 192.168.1.100`
+2. Ping the robot with `ping 192.168.1.100`
+
+3. Move the robot to the starting position with `docker run -it --rm --net=host --privileged franka_ros communication_test 192.168.1.100`
 
 ### Running the ROS container
 
