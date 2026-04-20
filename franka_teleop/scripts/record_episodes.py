@@ -5,7 +5,10 @@ This is a standalone script that combines the
 cartesian + gripper teleop from ``xbox_teleop.py`` with simple episode
 recording: while an episode is active, every received ``franka_msgs/FrankaState``
 and every published cartesian command is appended to JSONL files inside a
-freshly-created episode directory.
+freshly-created episode directory. If a camera is available, the episode
+directory also contains ``video.mkv`` (FFV1, lossless) and
+``video_metadata.json`` with per-frame timestamps so each frame can be
+correlated with the state / command streams.
 
 It also supports a one-button "go home" that smoothly drives the equilibrium
 pose toward a hardcoded cartesian position.
@@ -37,7 +40,12 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Dict, Optional, TextIO, Tuple
+from typing import Dict, List, Optional, TextIO, Tuple
+
+try:
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    cv2 = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Defaults / constants
@@ -50,6 +58,12 @@ DEFAULT_STATE_TOPIC = "/franka_state_controller/franka_states"
 DEFAULT_FRAME = "panda_link0"
 DEFAULT_GRIPPER_NS = "/franka_gripper"
 DEFAULT_OUTPUT_DIR = "./episodes"
+
+# Video capture defaults
+DEFAULT_CAMERA = "0"
+DEFAULT_CAMERA_WIDTH = 640
+DEFAULT_CAMERA_HEIGHT = 480
+DEFAULT_CAMERA_FPS = 30.0
 
 # Gripper goal parameters
 GRIPPER_OPEN_WIDTH = 0.08            # [m]
@@ -415,6 +429,187 @@ def build_grasp_goal(
 
 
 # ---------------------------------------------------------------------------
+# Video recorder (OpenCV + FFV1/MKV)
+# ---------------------------------------------------------------------------
+
+
+class VideoRecorder(threading.Thread):
+    """Grabs frames from a camera and, while an episode is active, writes them
+    losslessly to ``video.mkv`` (FFV1 in Matroska). Per-frame timestamps are
+    accumulated in memory and flushed to ``video_metadata.json`` on stop.
+    """
+
+    def __init__(
+        self,
+        device: object,
+        width: int,
+        height: int,
+        fps: float,
+    ) -> None:
+        super().__init__(daemon=True)
+        if cv2 is None:
+            raise RuntimeError(
+                "OpenCV (cv2) is not available; install opencv-python or run with --no-video"
+            )
+
+        self._requested_device = device
+        self._requested_fps = float(fps)
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+        self._cap = cv2.VideoCapture(device)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"could not open camera device {device!r}")
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        self._cap.set(cv2.CAP_PROP_FPS, float(fps))
+
+        # Grab a probe frame to discover the actual frame size the driver will
+        # deliver; the VideoWriter needs an exact match or it silently fails.
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            self._cap.release()
+            raise RuntimeError(f"camera device {device!r} opened but produced no frame")
+        actual_h, actual_w = frame.shape[:2]
+        self._width = int(actual_w)
+        self._height = int(actual_h)
+        reported_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        self._fps = reported_fps if reported_fps > 1.0 else float(fps)
+
+        self._writer: Optional["cv2.VideoWriter"] = None
+        self._ep_dir: Optional[str] = None
+        self._frames: List[Dict] = []
+        self._episode_start_t_wall: Optional[float] = None
+        self._episode_start_t_mono: Optional[float] = None
+        self._frames_dropped = 0
+        self._total_frames_grabbed = 0
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def start_episode(self, ep_dir: str) -> Optional[str]:
+        """Begin writing frames into ``<ep_dir>/video.mkv``. Safe to call while
+        the capture thread is running. Returns the video path on success."""
+        assert cv2 is not None
+        fourcc = cv2.VideoWriter_fourcc(*"FFV1")
+        video_path = os.path.join(ep_dir, "video.mkv")
+        writer = cv2.VideoWriter(
+            video_path, fourcc, self._fps, (self._width, self._height), True
+        )
+        if not writer.isOpened():
+            print(
+                f"[record] WARNING: could not open VideoWriter with FFV1 at {video_path}; "
+                "video will not be recorded for this episode.",
+                file=sys.stderr,
+            )
+            return None
+        with self._lock:
+            self._writer = writer
+            self._ep_dir = ep_dir
+            self._frames = []
+            self._episode_start_t_wall = time.time()
+            self._episode_start_t_mono = time.monotonic()
+        return video_path
+
+    def stop_episode(self) -> None:
+        """Close the VideoWriter and flush ``video_metadata.json``."""
+        with self._lock:
+            writer = self._writer
+            ep_dir = self._ep_dir
+            frames = self._frames
+            start_wall = self._episode_start_t_wall
+            start_mono = self._episode_start_t_mono
+            self._writer = None
+            self._ep_dir = None
+            self._frames = []
+            self._episode_start_t_wall = None
+            self._episode_start_t_mono = None
+
+        if writer is not None:
+            try:
+                writer.release()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        if ep_dir is None:
+            return
+
+        meta = {
+            "video_file": "video.mkv",
+            "codec": "FFV1",
+            "container": "matroska",
+            "pixel_format": "bgr24",
+            "width": self._width,
+            "height": self._height,
+            "fps": self._fps,
+            "requested_device": repr(self._requested_device),
+            "requested_fps": self._requested_fps,
+            "frame_count": len(frames),
+            "start_wall_time": start_wall,
+            "start_mono_time": start_mono,
+            "frames": frames,
+        }
+        try:
+            with open(os.path.join(ep_dir, "video_metadata.json"), "w") as fh:
+                json.dump(meta, fh, indent=2)
+        except OSError as exc:
+            print(
+                f"[record] WARNING: could not write video_metadata.json: {exc}",
+                file=sys.stderr,
+            )
+
+    def run(self) -> None:
+        assert cv2 is not None
+        while not self._stop.is_set():
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                # Camera hiccup: back off briefly and try again.
+                time.sleep(0.005)
+                continue
+
+            t_wall = time.time()
+            t_mono = time.monotonic()
+            self._total_frames_grabbed += 1
+
+            with self._lock:
+                writer = self._writer
+                if writer is None:
+                    continue
+                # Enforce consistent frame size for the writer.
+                if frame.shape[1] != self._width or frame.shape[0] != self._height:
+                    frame = cv2.resize(frame, (self._width, self._height))
+                try:
+                    writer.write(frame)
+                except Exception:  # pragma: no cover - defensive
+                    self._frames_dropped += 1
+                    continue
+                self._frames.append(
+                    {
+                        "index": len(self._frames),
+                        "t_wall": t_wall,
+                        "t_mono": t_mono,
+                    }
+                )
+
+        try:
+            self._cap.release()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Episode recorder
 # ---------------------------------------------------------------------------
 
@@ -422,10 +617,17 @@ def build_grasp_goal(
 class EpisodeRecorder:
     """Owns the per-episode directory and append-only JSONL files."""
 
-    def __init__(self, output_dir: str, receiver: StateReceiver, args: argparse.Namespace) -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        receiver: StateReceiver,
+        args: argparse.Namespace,
+        video: Optional[VideoRecorder] = None,
+    ) -> None:
         self._output_dir = os.path.abspath(os.path.expanduser(output_dir))
         self._receiver = receiver
         self._args = args
+        self._video = video
         self._active = False
         self._dir: Optional[str] = None
         self._states_fh: Optional[TextIO] = None
@@ -486,6 +688,20 @@ class EpisodeRecorder:
             "home_position": list(HOME_POSITION),
         }
 
+        video_path: Optional[str] = None
+        if self._video is not None:
+            try:
+                video_path = self._video.start_episode(unique_dir)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"[record] WARNING: video recording failed to start: {exc}",
+                    file=sys.stderr,
+                )
+                video_path = None
+        if video_path is not None:
+            self._meta["video_file"] = os.path.basename(video_path)
+            self._meta["video_metadata_file"] = "video_metadata.json"
+
         self._receiver.set_recording_file(states_fh)
         self._active = True
         self.log_event("episode_started", {"directory": unique_dir})
@@ -502,6 +718,15 @@ class EpisodeRecorder:
         # Detach the recorder file from the state thread first, so no further
         # appends race with close().
         self._receiver.set_recording_file(None)
+
+        if self._video is not None:
+            try:
+                self._video.stop_episode()
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"[record] WARNING: video recording failed to stop cleanly: {exc}",
+                    file=sys.stderr,
+                )
 
         states_count = self._receiver.state_count() - self._start_state_count
         self._meta.update(
@@ -656,7 +881,39 @@ def run(args: argparse.Namespace) -> int:
     client.advertise(grasp_goal_topic, "franka_gripper/GraspActionGoal")
     time.sleep(0.1)
 
-    recorder = EpisodeRecorder(args.output_dir, receiver, args)
+    video: Optional[VideoRecorder] = None
+    if not args.no_video:
+        if cv2 is None:
+            print(
+                "[record] WARNING: OpenCV not available; continuing without video. "
+                "Install opencv-python or pass --no-video to silence this.",
+                file=sys.stderr,
+            )
+        else:
+            device: object = args.camera
+            if isinstance(device, str) and device.isdigit():
+                device = int(device)
+            try:
+                video = VideoRecorder(
+                    device=device,
+                    width=args.camera_width,
+                    height=args.camera_height,
+                    fps=args.camera_fps,
+                )
+                video.start()
+                print(
+                    f"[record] camera ready: device={args.camera} "
+                    f"{video.width}x{video.height} @ {video.fps:.1f} fps (FFV1/mkv)"
+                )
+            except Exception as exc:
+                print(
+                    f"[record] WARNING: could not initialise camera: {exc}. "
+                    "Continuing without video.",
+                    file=sys.stderr,
+                )
+                video = None
+
+    recorder = EpisodeRecorder(args.output_dir, receiver, args, video=video)
 
     enabled = False
     going_home = False
@@ -838,6 +1095,8 @@ def run(args: argparse.Namespace) -> int:
                 pass
         joystick.stop()
         receiver.stop()
+        if video is not None:
+            video.stop()
         client.close()
 
     return 0
@@ -870,6 +1129,38 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
         help="root directory under which episode_<timestamp>/ folders are created",
+    )
+    parser.add_argument(
+        "--camera",
+        default=DEFAULT_CAMERA,
+        help=(
+            "camera device passed to cv2.VideoCapture. Integer strings become "
+            "an index (e.g. '0'); other values are passed through as-is "
+            "(e.g. '/dev/video0' or a GStreamer pipeline)."
+        ),
+    )
+    parser.add_argument(
+        "--camera-width",
+        type=int,
+        default=DEFAULT_CAMERA_WIDTH,
+        help="requested camera frame width in pixels",
+    )
+    parser.add_argument(
+        "--camera-height",
+        type=int,
+        default=DEFAULT_CAMERA_HEIGHT,
+        help="requested camera frame height in pixels",
+    )
+    parser.add_argument(
+        "--camera-fps",
+        type=float,
+        default=DEFAULT_CAMERA_FPS,
+        help="requested camera frame rate (used for the FFV1 VideoWriter)",
+    )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="disable camera capture / video recording entirely",
     )
     return parser.parse_args()
 
