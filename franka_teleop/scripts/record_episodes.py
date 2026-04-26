@@ -8,7 +8,8 @@ and every published cartesian command is appended to JSONL files inside a
 freshly-created episode directory. If a camera is available, the episode
 directory also contains ``video.mkv`` (FFV1, lossless) and
 ``video_metadata.json`` with per-frame timestamps so each frame can be
-correlated with the state / command streams.
+correlated with the state / command streams. With a GUI display available, the
+camera feed is also shown in a live OpenCV preview window.
 
 It also supports a one-button "go home" that smoothly drives the equilibrium
 pose toward a hardcoded cartesian position.
@@ -27,6 +28,7 @@ Usage:
     python3 record_episodes.py
     python3 record_episodes.py --output-dir ~/datasets/panda_teleop \\
         --device /dev/input/js1
+    python3 record_episodes.py --no-preview
 """
 
 import argparse
@@ -64,6 +66,7 @@ DEFAULT_CAMERA = "0"
 DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
 DEFAULT_CAMERA_FPS = 30.0
+DEFAULT_PREVIEW_WINDOW = "Franka camera preview"
 
 # Gripper goal parameters
 GRIPPER_OPEN_WIDTH = 0.08            # [m]
@@ -122,6 +125,13 @@ def apply_deadzone(value: float, deadzone: float) -> float:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def gui_display_available() -> bool:
+    """Best-effort guard against opening OpenCV windows in headless Linux."""
+    if sys.platform.startswith("linux"):
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
 
 
 def _ros_stamp_now() -> Dict:
@@ -445,6 +455,8 @@ class VideoRecorder(threading.Thread):
         width: int,
         height: int,
         fps: float,
+        preview: bool = False,
+        preview_window: str = DEFAULT_PREVIEW_WINDOW,
     ) -> None:
         super().__init__(daemon=True)
         if cv2 is None:
@@ -456,6 +468,10 @@ class VideoRecorder(threading.Thread):
         self._requested_fps = float(fps)
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._preview_enabled = bool(preview)
+        self._preview_window = preview_window
+        self._preview_created = False
+        self._preview_warning_printed = False
 
         self._cap = cv2.VideoCapture(device)
         if not self._cap.isOpened():
@@ -483,6 +499,7 @@ class VideoRecorder(threading.Thread):
         self._episode_start_t_mono: Optional[float] = None
         self._frames_dropped = 0
         self._total_frames_grabbed = 0
+        self._latest_frame = frame.copy() if self._preview_enabled else None
 
     @property
     def width(self) -> int:
@@ -496,8 +513,88 @@ class VideoRecorder(threading.Thread):
     def fps(self) -> float:
         return self._fps
 
+    @property
+    def preview_enabled(self) -> bool:
+        return self._preview_enabled
+
     def stop(self) -> None:
         self._stop.set()
+
+    def close_preview(self) -> None:
+        """Close the preview window and stop retaining preview frames."""
+        with self._lock:
+            self._preview_enabled = False
+            self._latest_frame = None
+
+        if self._preview_created:
+            try:
+                cv2.destroyWindow(self._preview_window)
+                cv2.waitKey(1)
+            except Exception:  # pragma: no cover - depends on OpenCV GUI backend
+                pass
+        self._preview_created = False
+
+    def poll_preview(self, recording: bool, enabled: bool, going_home: bool) -> None:
+        """Render the latest frame and service OpenCV GUI events.
+
+        OpenCV HighGUI calls are deliberately kept out of the capture thread;
+        some backends expect window operations to happen on the main thread.
+        """
+        if not self._preview_enabled:
+            return
+
+        with self._lock:
+            latest = None if self._latest_frame is None else self._latest_frame.copy()
+
+        if latest is None:
+            return
+
+        try:
+            if not self._preview_created:
+                cv2.namedWindow(self._preview_window, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(
+                    self._preview_window,
+                    min(self._width, 960),
+                    min(self._height, 720),
+                )
+                self._preview_created = True
+
+            label = "REC" if recording else "IDLE"
+            mode = "HOME" if going_home else ("ON" if enabled else "OFF")
+            overlay = latest
+            cv2.rectangle(overlay, (0, 0), (overlay.shape[1], 34), (0, 0, 0), -1)
+            cv2.putText(
+                overlay,
+                f"{label}  motion:{mode}",
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 0, 255) if recording else (220, 220, 220),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(self._preview_window, overlay)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q"), 27):
+                print("\n[record] camera preview closed.")
+                self.close_preview()
+                return
+
+            try:
+                visible = cv2.getWindowProperty(self._preview_window, cv2.WND_PROP_VISIBLE)
+            except Exception:  # pragma: no cover - backend-specific behavior
+                visible = 1.0
+            if visible < 1.0:
+                self.close_preview()
+        except Exception as exc:  # pragma: no cover - depends on OpenCV GUI backend
+            if not self._preview_warning_printed:
+                print(
+                    f"\n[record] WARNING: camera preview disabled: {exc}",
+                    file=sys.stderr,
+                )
+                self._preview_warning_printed = True
+            self.close_preview()
 
     def start_episode(self, ep_dir: str) -> Optional[str]:
         """Begin writing frames into ``<ep_dir>/video.mkv``. Safe to call while
@@ -582,14 +679,16 @@ class VideoRecorder(threading.Thread):
             t_wall = time.time()
             t_mono = time.monotonic()
             self._total_frames_grabbed += 1
+            if frame.shape[1] != self._width or frame.shape[0] != self._height:
+                frame = cv2.resize(frame, (self._width, self._height))
 
             with self._lock:
+                if self._preview_enabled:
+                    self._latest_frame = frame.copy()
+
                 writer = self._writer
                 if writer is None:
                     continue
-                # Enforce consistent frame size for the writer.
-                if frame.shape[1] != self._width or frame.shape[0] != self._height:
-                    frame = cv2.resize(frame, (self._width, self._height))
                 try:
                     writer.write(frame)
                 except Exception:  # pragma: no cover - defensive
@@ -890,6 +989,14 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         else:
+            preview_enabled = args.preview if args.preview is not None else True
+            if preview_enabled and args.preview is None and not gui_display_available():
+                preview_enabled = False
+                print(
+                    "[record] camera preview disabled: no GUI display detected. "
+                    "Pass --preview to force it.",
+                    file=sys.stderr,
+                )
             device: object = args.camera
             if isinstance(device, str) and device.isdigit():
                 device = int(device)
@@ -899,12 +1006,16 @@ def run(args: argparse.Namespace) -> int:
                     width=args.camera_width,
                     height=args.camera_height,
                     fps=args.camera_fps,
+                    preview=preview_enabled,
                 )
                 video.start()
                 print(
                     f"[record] camera ready: device={args.camera} "
-                    f"{video.width}x{video.height} @ {video.fps:.1f} fps (FFV1/mkv)"
+                    f"{video.width}x{video.height} @ {video.fps:.1f} fps (FFV1/mkv"
+                    f"{', preview' if video.preview_enabled else ''})"
                 )
+                if video.preview_enabled:
+                    print("[record] preview window: q/Esc closes preview")
             except Exception as exc:
                 print(
                     f"[record] WARNING: could not initialise camera: {exc}. "
@@ -1052,6 +1163,8 @@ def run(args: argparse.Namespace) -> int:
 
             client.publish(args.topic, build_pose_msg(args.frame_id, position, COMMAND_QUAT))
             recorder.log_command(position, COMMAND_QUAT, enabled, going_home)
+            if video is not None:
+                video.poll_preview(recorder.active, enabled, going_home)
 
             now = time.monotonic()
             if now - last_status > 0.5:
@@ -1096,6 +1209,7 @@ def run(args: argparse.Namespace) -> int:
         joystick.stop()
         receiver.stop()
         if video is not None:
+            video.close_preview()
             video.stop()
         client.close()
 
@@ -1157,6 +1271,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CAMERA_FPS,
         help="requested camera frame rate (used for the FFV1 VideoWriter)",
     )
+    preview_group = parser.add_mutually_exclusive_group()
+    preview_group.add_argument(
+        "--preview",
+        dest="preview",
+        action="store_true",
+        help=(
+            "show a live OpenCV camera preview window; this is the default when "
+            "a GUI display is detected"
+        ),
+    )
+    preview_group.add_argument(
+        "--no-preview",
+        dest="preview",
+        action="store_false",
+        help="disable the live camera preview window while keeping video recording enabled",
+    )
+    parser.set_defaults(preview=None)
     parser.add_argument(
         "--no-video",
         action="store_true",
