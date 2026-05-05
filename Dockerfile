@@ -1,6 +1,16 @@
 ARG FROM_IMAGE=docker.io/ros:noetic
 ARG OVERLAY_WS=/opt/ros/overlay_ws
 
+ARG FRANKA_SOURCE_PACKAGES="\
+  src/franka_ros/franka_description \
+  src/franka_ros/franka_msgs \
+  src/franka_ros/franka_gripper \
+  src/franka_ros/franka_hw \
+  src/franka_ros/franka_control \
+  src/franka_ros/franka_example_controllers \
+  src/franka_ros/franka_teleop"
+ARG ROSDEP_SKIP_KEYS="panda_moveit_config moveit_commander"
+
 # multi-stage for caching
 FROM $FROM_IMAGE AS cacher
 
@@ -27,14 +37,16 @@ FROM $FROM_IMAGE AS builder
 
 # install overlay dependencies
 ARG OVERLAY_WS
+ARG FRANKA_SOURCE_PACKAGES
+ARG ROSDEP_SKIP_KEYS
 WORKDIR $OVERLAY_WS
 COPY --from=cacher /tmp/$OVERLAY_WS/src ./src
 RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
     apt-get update \
     && apt-get install -y python3-catkin-tools ros-$ROS_DISTRO-catkin-virtualenv python3-testresources nlohmann-json3-dev \
     && rosdep install -y \
-      --from-paths \
-        src/franka_ros/franka_teleop \
+      --from-paths $FRANKA_SOURCE_PACKAGES \
+      --skip-keys "$ROSDEP_SKIP_KEYS" \
       --ignore-src \
     && rm -rf /var/lib/apt/lists/*
 
@@ -44,20 +56,29 @@ COPY --from=cacher $OVERLAY_WS/src ./src
 RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
     catkin init && \
     catkin config --install --cmake-args -DCMAKE_BUILD_TYPE=Release && \
-    catkin build franka_teleop && \
+    catkin build \
+      franka_description \
+      franka_msgs \
+      franka_gripper \
+      franka_hw \
+      franka_control \
+      franka_example_controllers \
+      franka_teleop && \
     rm -rf build log
 
 FROM docker.io/ros:noetic-ros-core AS runner
 
 ARG OVERLAY_WS
+ARG FRANKA_SOURCE_PACKAGES
+ARG ROSDEP_SKIP_KEYS
 WORKDIR $OVERLAY_WS
 COPY --from=cacher /tmp/$OVERLAY_WS/src ./src
 RUN . /opt/ros/$ROS_DISTRO/setup.sh && \
     apt-get update \
     && apt-get install -y python3-rosdep \
     && rosdep init && rosdep update --rosdistro $ROS_DISTRO && rosdep install -y \
-      --from-paths \
-        src/franka_ros/franka_teleop \
+      --from-paths $FRANKA_SOURCE_PACKAGES \
+      --skip-keys "$ROSDEP_SKIP_KEYS" \
       --ignore-src \
     && rm -rf /var/lib/apt/lists/*
 

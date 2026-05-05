@@ -1,1 +1,8 @@
 Dockerfile
+.git/
+build/
+devel/
+install/
+log/
+*.tar
+**/.venv/
